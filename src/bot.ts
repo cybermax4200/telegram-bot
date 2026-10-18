@@ -941,7 +941,7 @@ export interface SendExtra {
    * Plain-text rendering of the same notification, sent without a `parse_mode`
    * when Telegram rejects the MarkdownV2 version for entity/parse reasons.
    * Optional: without it the notifier behaves exactly as before (parse errors
-   * propagate, no second send).
+   * propagate, no second send). Empty or whitespace-only values count as absent.
    */
   plainText?: string | undefined;
   /**
@@ -993,24 +993,51 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
 }
 
 /**
+ * Sends suppressed by the empty-message guard, counted so callers (and the
+ * empty-text tests) can prove a blank render never reached the Telegram API.
+ */
+export const notifierSkips = { emptyText: 0 };
+
+/**
  * The poller's send path: route each contract's messages to its named chat,
  * with the event's explorer button when `extra.reply_markup` is set.
  *
  * MarkdownV2 first; exactly one plain-text retry when Telegram rejects the
- * entities *and* the caller supplied `extra.plainText`. The retry carries no
- * `parse_mode`, so it cannot fail the same way. Every other failure —
+ * entities *and* the caller supplied a non-blank `extra.plainText`. The retry
+ * carries no `parse_mode`, so it cannot fail the same way. Every other failure —
  * network, rate limit, auth, unknown chats, or a failed plain-text retry —
  * propagates unchanged, preserving the poller's existing error/cursor
  * accounting. An oversized payload is split into chunks and an
  * unspecified one into a single call, so the MarkdownV2-to-plain-text
  * retry happens at most once per chunk, never in a loop.
+ *
+ * A rendering that is empty, whitespace-only, or not a string at all is
+ * skipped before any API call: Telegram rejects blank message text with a
+ * 400, and a formatters' `null` must never turn into a doomed send. The skip
+ * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
     Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad">>,
 ) {
-  return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
+  return async (
+    text: string | null,
+    source?: ContractSource,
+    extra?: SendExtra,
+  ): Promise<void> => {
+    if (typeof text !== "string" || text.trim() === "") {
+      notifierSkips.emptyText += 1;
+      // Only bounded metadata: which chat path and how short the render was —
+      // never the payload itself.
+      console.warn(
+        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
+          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
+          `chars=${typeof text === "string" ? text.length : -1})`,
+      );
+      return;
+    }
+
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
     const chatId = source === "market"
       ? config.marketChatId || defaultChat
@@ -1060,8 +1087,10 @@ export function createNotifier(
       });
       return;
     } catch (err) {
+      // A blank fallback is no fallback: sending whitespace-only text would
+      // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback === "" || !isMarkdownParseError(err)) {
+      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
         throw err;
       }
       // Only bounded metadata is logged: the fallback outcome, the safe error
